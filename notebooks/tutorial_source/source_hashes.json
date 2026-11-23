@@ -1,0 +1,8 @@
+{
+  "source_repository": "https://github.com/jbermejovega/Quantum-AI-for-Queens",
+  "tutorial_directory": "tutorials/TUTORIAL_2026_2027",
+  "files": {
+    "Quimb_DMRG_MPS_TFIM.ipynb": "c0885154b2bc2d02f90cbe76cabe5f791531f4d8726111db14f647da0cedc1e4",
+    "VQE_TFIM.ipynb": "b5a361c88964f5205b68608595b664fc41b761782f204a9e3de14b0b4534c63f"
+  }
+}

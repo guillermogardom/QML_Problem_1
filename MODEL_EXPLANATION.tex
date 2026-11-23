@@ -1,0 +1,250 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+\usepackage{lmodern}
+\usepackage{geometry,amsmath,amssymb,booktabs,graphicx,float,enumitem}
+\usepackage{hyperref}
+\geometry{margin=2.4cm}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+\providecommand{\ket}[1]{\left|#1\right\rangle}
+\providecommand{\bra}[1]{\left\langle#1\right|}
+
+\newcommand{\plot}[3]{\begin{figure}[htbp]\centering
+\IfFileExists{results/tutorial_faithful/#1}{\includegraphics[width=.85\textwidth]{results/tutorial_faithful/#1}}%
+{\fbox{\parbox[c][2.5cm][c]{.8\textwidth}{\centering Image not found at \texttt{\detokenize{results/tutorial_faithful/#1}}.}}}
+\caption{#2}\label{#3}\end{figure}}
+
+\title{\textbf{Computational Study of the Transverse-Field Ising Model}\\
+\large DMRG/MPS and VQE: Algorithms, Parameter Analysis, Tutorial Extensions, and Hardware Limits}
+\author{Guillermo García Domingo}
+\date{Academic year 2026--2027}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report provides a comprehensive theoretical, algorithmic, and empirical analysis of two numerical approaches to the ground state of the one-dimensional transverse-field Ising model (TFIM) with open boundary conditions: Quimb density-matrix renormalization group (DMRG) with matrix product states (MPS), and a TensorCircuit variational quantum eigensolver (VQE) executed on a classical TensorFlow statevector backend. Starting from the 2026--2027 course tutorials, we resolve Hamiltonian convention mismatches, reproduce all baseline observables locally, perform systematic sweeps across physical regimes, ansatz depth, bond dimension, optimizer hyperparameters, and system size, and stress-test both solvers to locate the practical computational limits of our workstation. All verified outputs reside in \texttt{results/tutorial\_faithful/}.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ==============================================================================
+\section{Assignment Objective and Scope}
+% ==============================================================================
+In accordance with the 2026--2027 session instructions, this project builds upon the instructor's Quimb DMRG/MPS and TensorCircuit VQE tutorials and the background notes in \texttt{references/notes\_ising.pdf}. Specifically, the assignment requires:
+\begin{enumerate}[leftmargin=*]
+\item Reproducing all tutorial plots locally on a personal computer.
+\item Varying physical couplings, algorithm hyperparameters, and spin/qubit count $L$.
+\item Stress-testing (``torturing'') both solvers to observe where approximations break down and where hardware resources (CPU time or RAM) become prohibitive.
+\item Delivering a reproducible online GitHub repository and a thorough English lab report.
+\end{enumerate}
+
+All 58 structured DMRG runs, 51 field-scan points, 81 structured VQE runs, and 9 guarded frontier cases in \texttt{limit\_search.py} were executed sequentially on a single Windows 10 workstation (Intel64 CPU with 12 physical / 16 logical cores, $15.72\,\mathrm{GiB}$ installed RAM, \texttt{CPU:0} only) to ensure uncontested timing and memory measurements.
+
+% ==============================================================================
+\section{Hamiltonian and Physical Regimes}
+% ==============================================================================
+For an open chain of $L$ spin-$1/2$ sites ($S_i^\alpha = \sigma_i^\alpha / 2$), the tutorial Hamiltonian is
+\begin{equation}
+H = +J \sum_{i=1}^{L-1} S_i^z S_{i+1}^z - h \sum_{i=1}^{L} S_i^x
+  = +\frac{J}{4} \sum_{i=1}^{L-1} Z_i Z_{i+1} - \frac{h}{2} \sum_{i=1}^{L} X_i.
+\label{eq:H}
+\end{equation}
+Setting $J=1$ and introducing the dimensionless transverse-field ratio $g = h/J$, the model exhibits three distinct physical regimes separated by a quantum phase transition at $g_c = 1/2$ in the thermodynamic limit ($L \to \infty$) \cite{Pfeuty}:
+\begin{itemize}[leftmargin=*]
+\item \textbf{Ordered antiferromagnetic phase ($g < 0.5$):} Because $J > 0$ in Quimb's convention, nearest-neighbour $+J S_i^z S_{i+1}^z$ penalizes aligned spins and favours staggered antiferromagnetic $Z$-order ($\ket{\uparrow\downarrow\uparrow\downarrow\dots}$). On a finite open chain, the exact ground state preserves global $\mathbb{Z}_2$ spin-flip symmetry ($\prod_i X_i$), leading to an exponentially small tunneling gap between the two symmetry-broken N\'eel states.
+\item \textbf{Quantum critical point ($g_c = 0.5$):} Competition between non-commuting $ZZ$ and $X$ terms closes the bulk energy gap. Correlations decay algebraically as $|\langle Z_i Z_{i+r}\rangle| \sim r^{-\eta}$ with anomalous dimension $\eta = 1/4$, the thermodynamic longitudinal order parameter vanishes as $|m_z| \sim (g_c - g)^\beta$ with $\beta = 1/8$, and bipartite entanglement entropy grows logarithmically with subsystem size according to conformal field theory (CFT) with Ising central charge $c = 1/2$.
+\item \textbf{Disordered paramagnetic phase ($g > 0.5$):} The transverse field dominates, aligning spins along $+x$ toward the product state $\ket{+}^{\otimes L}$ as $g \to \infty$. Excitations are gapped, correlations decay exponentially, and bipartite entanglement entropy remains bounded (area law).
+\end{itemize}
+
+% ==============================================================================
+\section{Algorithmic Foundations: How the Two Methods Work}
+% ==============================================================================
+\subsection{DMRG and Matrix Product States (Quimb)}
+In an exact Hilbert space of $L$ qubits, storing an arbitrary state $\ket{\psi}$ requires $2^L$ complex amplitudes. An MPS compresses this state into a chain of local rank-3 tensors $A^{[k]s_k}$ ($s_k \in \{0,1\}$) connected by virtual bonds of dimension at most $\chi$:
+\begin{equation}
+\ket{\psi} = \sum_{s_1,\dots,s_L} A^{[1]s_1} A^{[2]s_2} \cdots A^{[L]s_L} \ket{s_1 \dots s_L}.
+\end{equation}
+Inside \texttt{01\_DMRG\_MPS\_Stress\_Tests.ipynb}, Quimb executes the following pipeline \cite{QuimbDMRG,Quimb1D}:
+\begin{enumerate}[leftmargin=*]
+\item \textbf{MPO construction (\texttt{qtn.MPO\_ham\_ising}):} Encodes Eq.~\eqref{eq:H} compactly as a Matrix Product Operator (MPO) of small constant bond dimension ($D_{\mathrm{MPO}} = 3$), avoiding the $2^L \times 2^L$ dense matrix.
+\item \textbf{Two-site DMRG sweeps (\texttt{qtn.DMRG2}):} Sweeps back and forth across the chain. At each pair of adjacent sites $(i, i+1)$, it forms an effective local Hamiltonian by contracting the left and right MPO/MPS environments and solves a small local eigenvalue problem using Lanczos/Krylov iteration.
+\item \textbf{SVD truncation:} Splits the optimized two-site tensor via Singular Value Decomposition (SVD) and retains at most the $\chi$ largest singular values. Keeping the MPS in mixed canonical form around the active bond makes local updates numerically stable and yields the exact von Neumann entanglement entropy directly from the Schmidt spectrum $\lambda_\alpha$:
+\begin{equation}
+S(l) = -\sum_{\alpha=1}^{\chi} \lambda_\alpha^2 \log_2(\lambda_\alpha^2) \quad \text{(measured in bits by \texttt{psi.entropy(l)})}.
+\end{equation}
+\item \textbf{Complexity:} Memory scales as $O(L \chi^2)$ and CPU runtime scales as $O(L \chi^3)$ per sweep (dominated by the SVD and environment contractions of $\chi \times \chi$ matrices), completely bypassing the exponential $2^L$ barrier whenever entanglement is bounded.
+\end{enumerate}
+
+\subsection{Statevector VQE (TensorCircuit + TensorFlow)}
+VQE exploits the Rayleigh--Ritz variational principle: for any normalized trial wavefunction $\ket{\psi(\boldsymbol{\theta})}$, $E(\boldsymbol{\theta}) = \bra{\psi(\boldsymbol{\theta})} H \ket{\psi(\boldsymbol{\theta})} \ge E_0$. Inside \texttt{02\_VQE\_TFIM\_Stress\_Tests.ipynb} \cite{TensorCircuitVQE}:
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Ansatz circuit:} Initializes $\ket{+}^{\otimes L}$ via Hadamard gates $H^{\otimes L}$, then applies $p = \text{\texttt{n\_layers}}$ layers. Each layer consists of nearest-neighbour two-qubit $ZZ$ entanglers $\exp(-i\theta_{l,i} Z_i Z_{i+1})$ (\texttt{circuit.exp1}) followed by sitewise single-qubit rotations $R_x(\phi_{l,i})$ (\texttt{circuit.rx}), yielding $2 p L$ continuous variational parameters.
+\item \textbf{Exact statevector simulation:} TensorCircuit evolves the full $2^L$-component \texttt{complex64} statevector ($8 \cdot 2^L$ bytes raw storage) and computes exact Pauli expectations $\langle X_i \rangle$ and $\langle Z_i Z_{i+1} \rangle$ without finite-shot statistical noise or hardware decoherence.
+\item \textbf{Automatic differentiation and Adam:} TensorFlow's \texttt{tf.GradientTape} records all tensor contractions of the circuit during the forward pass and computes exact gradients $\nabla_{\boldsymbol{\theta}} E(\boldsymbol{\theta})$ via reverse-mode automatic differentiation. Adam updates parameters using adaptive first- and second-moment estimates. Reverse-mode AD must retain intermediate statevector tensors in RAM across circuit gates, multiplying memory usage well above the bare $8\cdot 2^L$ lower bound.
+\end{enumerate}
+
+% ==============================================================================
+\section{Tutorial Baseline vs. Our Repository: Code Audit and Extensions}
+% ==============================================================================
+Rather than modifying the instructor's files, both original notebooks remain untouched under \texttt{notebooks/tutorial\_source/}. Table~\ref{tab:diff} summarizes every bug corrected and every experimental extension programmed in our repository.
+
+\begin{table}[H]\centering
+\caption{Comparison between the source course tutorials and our aligned repository.}
+\label{tab:diff}
+\small
+\begin{tabular}{p{3.0cm} p{5.8cm} p{6.2cm}}
+\toprule
+\textbf{Component} & \textbf{Instructor Tutorial} & \textbf{Our Aligned Repository} \\
+\midrule
+VQE Hamiltonian & Used $h=1.0$ in exact diag., $b_x=0.5$ in DMRG, and negative $-J/4$ $ZZ$ in VQE (mixed models). & Unified all three solvers to Eq.~\eqref{eq:H}: identical $g=h/J$ and positive $+J/4$ $ZZ$ coupling. \\
+\addlinespace
+DMRG order-parameter overlay & Fixed \texttt{j=1.0} in Quimb, but plotted $\lambda = b_x/(1-b_x)$. & Plots both the exact Pfeuty curve $[1-(2g)^2]^{1/8}$ for fixed $j=1$ and the literal course formula. \\
+\addlinespace
+Observable contraction & Used \texttt{psi.H @ psi\_z}, which raised \texttt{UnicodeEncodeError} on Windows. & Uses Quimb's MPS-native \texttt{psi.local\_expectation} (with safe fallback) to eliminate full-TN overhead. \\
+\addlinespace
+GPU section & Tutorial 1 ran synthetic random-matrix SVDs in JAX (not Quimb DMRG) with hardcoded timings. & Omitted cleanly on our \texttt{CPU:0}-only laptop; zero unverified GPU claims are made. \\
+\addlinespace
+Exact reference & Used \texttt{qibo} up to $L=12$. & Uses Quimb \texttt{.to\_dense()} for $L\le 10$ and converged DMRG ($\chi=64$) at $L=12$, avoiding extra dependencies. \\
+\addlinespace
+Stress-test extensions & Single-seed VQE ($L=4..12$); single DMRG runs without error logging. & Added 3-seed VQE statistics, field/depth/optimizer grids, $\chi$ and $L\le 200$ sweeps, CFT/exponent window fits, CSV schema-safe logging, and \texttt{limit\_search.py} with $0.2\,\mathrm{s}$ RSS sampling. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ==============================================================================
+\section{Exhaustive Parameter Guide: Meaning, Implications, and Observed Effects}
+% ==============================================================================
+Every parameter in our notebooks and \texttt{limit\_search.py} controls a specific physical property, numerical approximation, or computational resource. Below is the complete justification for each choice and what happened when we varied it.
+
+\subsection{Physical Parameters}
+\begin{itemize}[leftmargin=*]
+\item \textbf{Ising coupling $J$ (fixed at $J = 1.0$):} Sets the overall energy scale and antiferromagnetic sign of $S_i^z S_{i+1}^z$. Fixing $J=1$ avoids redundant rescaling because only the dimensionless ratio $g = h/J$ governs the phase diagram.
+\item \textbf{Transverse field ratio $g = h/J$ ($b_x$ in Quimb):} Controls quantum fluctuations competing against $Z$-ordering.
+  \begin{itemize}
+  \item \emph{DMRG 51-point scan ($g \in [0, 1]$, $\Delta g = 0.02$):} Uses 51 points to match the tutorial grid and ensure $g_c = 0.50$ lands on an exact grid point (index 25). Varying $g$ across $0.5$ drives $|m_z|$ from $\approx 1$ toward $0$ and concentrates entanglement and runtime around $g_c=0.5$.
+  \item \emph{VQE field sweep ($g \in \{0.10, 0.20, 0.35, 0.45, 0.50, 0.55, 0.65, 0.80, 1.00\}$ at $L=8$):} Clusters points around $g_c = 0.50$ to probe the crossover. Counterintuitively, VQE error is \emph{largest} at low $g$ ($\approx 0.24$ at $g=0.10$) and smallest at high $g$ ($\approx 0.01$ at $g=1.00$).
+  \end{itemize}
+\item \textbf{System size $L$ (number of spins / qubits):} Determines the Hilbert space dimension $2^L$.
+  \begin{itemize}
+  \item \emph{DMRG ($L \in [4, 200]$):} Chosen to validate against exact diagonalization ($L=4..10$), reproduce the tutorial magnetization ($L=40$), suppress edge effects in entropy ($L=60$) and correlations ($L=80$), and test macroscopic scaling ($L=20..200$). Varying $L$ scales DMRG runtime approximately linearly and keeps RSS nearly flat ($\sim 320\text{--}331\,\mathrm{MiB}$).
+  \item \emph{VQE ($L \in [4, 22]$):} Baseline uses $L=4,6,8,10,12$ (matching the tutorial) with 3 seeds; $L=8$ ($\dim\mathcal{H}=256$) serves as the fast workhorse ($\sim 35\,\mathrm{s}$/run) for the 66-run parameter sweeps; \texttt{limit\_search.py} pushes $L=14,16,18,20,22$ to expose exponential RAM and per-step time scaling.
+  \end{itemize}
+\end{itemize}
+
+\subsection{DMRG Algorithmic Parameters}
+\begin{itemize}[leftmargin=*]
+\item \textbf{Bond dimension $\chi$ ($\{8, 16, 32, 64, 128\}$ in notebook; $256$ in \texttt{limit\_search.py}):} Caps the maximum Schmidt rank across any bipartition, and thus the maximum entanglement $S_{\max} \le \log_2 \chi$. Doubling $\chi$ tests truncation convergence: at $L=40$, $E/L$ saturates by $\chi=16$, while runtime explodes as $O(\chi^3)$ ($0.40\,\mathrm{s}$ at $\chi=8$ to $11.84\,\mathrm{s}$ at $\chi=128$, and $133.22\,\mathrm{s}$ at $\chi=256$). For exact validation ($L \le 10$), setting $\chi=32 = 2^{10/2}$ makes the MPS representation mathematically exact.
+\item \textbf{Sweep budget \texttt{max\_sweeps} ($8$, or $6$ in pilot) and \texttt{tolerance} ($10^{-8}$, or $10^{-6}$ in field scan):} Controls iterative convergence of local Lanczos updates. Setting \texttt{max\_sweeps=8} and \texttt{tol=1e-8} balances machine-precision convergence ($3.578\times 10^{-8}$ max error vs.\ exact diagonalization) with deterministic runtime caps.
+\item \textbf{Boundary margin (\texttt{10\%} at $L=60$) and correlation windows ($r \in [2,8], [3,12], [5,16]$ at $L=80$):} Trimming $10\%$ from open ends removes boundary Friedel-like oscillations before fitting Calabrese--Cardy entropy; testing three windows in $r$ proves how sensitive power-law fits are to finite-chain boundary decay.
+\end{itemize}
+
+\subsection{VQE Algorithmic Parameters}
+\begin{itemize}[leftmargin=*]
+\item \textbf{Circuit depth \texttt{n\_layers} ($p \in \{1, 2, 3, 4\}$):} Controls entanglement range (a $p$-layer nearest-neighbour circuit spreads correlations over an effective light-cone of $\sim 2p$ sites) and parameter count ($2pL$). Increasing $p$ from $1 \to 4$ at $L=8, g=0.5$ cuts energy error from $\approx 0.092$ to $\approx 0.022$, saturating beyond $p=3$.
+\item \textbf{Adam \texttt{learning\_rate} ($\{0.001, 0.01, 0.05\}$) and \texttt{steps} ($\{100, 300, 600\}$):} Governs step size and iteration budget on a non-convex variational landscape. Too small a rate ($0.001$) stalls far from the minimum ($0.391$ error at 100 steps); $0.05$ over 600 steps reaches the best sampled accuracy ($0.025$ error).
+\item \textbf{Random \texttt{seed} ($\{0, 1, 2\}$):} Initializes parameters $\theta \sim \mathcal{N}(0, 0.1^2)$. Multiple seeds reveal local-minima spread (e.g.\ at $L=4$, errors vary by $4.5\times$ across seeds from $0.00079$ to $0.00353$; at $L=12$, from $0.0870$ to $0.1187$), proving single-seed runs are unreliable.
+\end{itemize}
+
+\subsection{Resource Guardrail Parameters (\texttt{limit\_search.py})}
+\begin{itemize}[leftmargin=*]
+\item \textbf{\texttt{min\_free\_gib} ($1.75\,\mathrm{GiB}$) and \texttt{budget\_seconds} ($120\,\mathrm{s}$):} Safety margins preventing OS freezes during exponential $L$ scaling. In \texttt{limit\_search.py}, VQE working-set memory is estimated at $256\times$ the bare \texttt{complex64} statevector ($2^{L-19}\,\mathrm{GiB}$). At $L=22$, this $8.0\,\mathrm{GiB}$ estimate exceeds the $4.04\,\mathrm{GiB}$ available RAM minus the $1.75\,\mathrm{GiB}$ reserve, triggering \texttt{SKIPPED\_MEMORY\_RESERVE}.
+\end{itemize}
+
+% ==============================================================================
+\section{Deep-Dive Analysis and Justification of Results}
+% ==============================================================================
+
+\subsection{DMRG/MPS Findings}
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Exact-diagonalization agreement ($3.578\times 10^{-8}$):} Across all 12 checks ($L \in \{4,6,8,10\}$, $g \in \{0.2, 0.5, 0.8\}$), $\chi=32$ DMRG matches dense \texttt{eigvalsh} to $O(10^{-8})$, directly bounded by the solver tolerance \texttt{tol=1e-8}.
+\item \textbf{Regime-dependent entanglement and $\chi$ saturation (Fig.~\ref{fig:chi}):} At $L=40$, mid-chain entropy $S(L/2)$ is negligible in the gapped ordered phase ($0.001719$ at $g=0.2$), small in the gapped disordered phase ($0.194833$ at $g=0.8$), and peaks at criticality ($0.728903$ at $g=0.5$). Consequently, energy per site converges by $\chi=16$ ($|\Delta E/L| \approx 7.52\times 10^{-8}$ from $\chi=8 \to 16$ at $g=0.5$, and $\sim 10^{-13}$ thereafter), while wall time grows sharply from $0.40\,\mathrm{s}$ ($\chi=8$) to $11.84\,\mathrm{s}$ ($\chi=128$) due to $O(\chi^3)$ SVD algebra.
+\item \textbf{Chain-length scaling and thermodynamic limit (Fig.~\ref{fig:size}):} All 24 runs ($L=20\dots 200$, $\chi=16$) completed in under $7\,\mathrm{s}$ per run ($2.85\,\mathrm{s}$ at $g=0.2$, $6.98\,\mathrm{s}$ at $g=0.5$, $2.80\,\mathrm{s}$ at $g=0.8$ for $L=200$), with post-run RSS flat at $319\text{--}331\,\mathrm{MiB}$. Critical energy density at $L=200$ reaches $E/L = -0.317856$, converging smoothly toward Pfeuty's exact infinite-chain value $-1/\pi \approx -0.318310$ with an $O(1/L)$ open-boundary surface correction.
+\item \textbf{Critical exponents ($c$, $\eta$, $\beta$) and why $\beta$ breaks:}
+  \begin{itemize}
+  \item \emph{Central charge ($L=60, \chi=64$, Fig.~\ref{fig:entropy}):} Fitting Calabrese--Cardy entropy in base-2 bits yields $c = 0.51834 \pm 0.00043$, within $3.7\%$ of the exact Ising CFT value $c = 0.50$. The slight excess reflects finite-size $L=60$ corrections.
+  \item \emph{Correlation exponent ($L=80, \chi=64$, Fig.~\ref{fig:corr}):} At $g=0.5$, power-law fits give $\eta = 0.2920$ ($r\in[2,8]$), $0.3193$ ($r\in[3,12]$), and $0.3596$ ($r\in[5,16]$) versus exact $\eta = 0.25$. As $r_{\max}$ increases, correlations feel the finite open ends ($L=80$) and decay faster than an infinite power law, inflating the fitted slope.
+  \item \emph{Order-parameter exponent ($L=40$, Fig.~\ref{fig:magnetization}):} Fitting $\log|m_z|$ on $g \in (0.40, 0.47)$ ($n=3$ points) yields $\beta = 6.628 \pm 1.743$ versus exact $\beta = 0.125$. \textbf{Physical justification:} Because Eq.~\eqref{eq:H} has exact $\mathbb{Z}_2$ parity symmetry and no longitudinal symmetry-breaking pinning field, finite-size tunneling splits the two N\'eel ground states as the correlation length $\xi$ approaches $L=40$, forcing DMRG toward a symmetric superposition where $\langle Z_{L/2}\rangle \to 0$ well below $g_c=0.5$. This makes raw $\beta$ extraction on an unpinned $L=40$ chain physically invalid.
+  \end{itemize}
+\end{enumerate}
+
+\plot{dmrg_magnetization_vs_field.png}{51-point local Pauli-$Z$ order scan ($L=40$, $\chi_{\max}=64$) with fixed-$H$ Pfeuty reference and literal course formula.}{fig:magnetization}
+\plot{dmrg_chi_convergence.png}{DMRG convergence in energy per site, mid-chain entropy $S(L/2)$, and wall time across $\chi=8\dots 128$ ($L=40$).}{fig:chi}
+\plot{dmrg_size_scaling.png}{DMRG chain-length scaling ($L=20\dots 200$, $\chi=16$).}{fig:size}
+\plot{dmrg_entropy.png}{Bipartite entanglement entropy across cuts ($L=60$, $\chi=64$).}{fig:entropy}
+\plot{dmrg_correlations.png}{Two-point correlations $|\langle Z_i Z_{i+r}\rangle|$ across three regimes ($L=80$, $\chi=64$).}{fig:corr}
+
+\subsection{VQE Findings}
+All 81 structured VQE runs completed cleanly. Table~\ref{tab:vqe_size} summarizes critical-field size scaling ($g=0.5$, 2 layers, 300 Adam steps, $\mathrm{lr}=0.01$, 3 seeds).
+
+\begin{table}[H]\centering
+\caption{Mean VQE results over three seeds at $g=0.5$ ($\text{layers}=2$, $\mathrm{lr}=0.01$, $300$ steps).}
+\label{tab:vqe_size}
+\begin{tabular}{rrrrrr}\toprule
+$L$ & Reference $E_0$ & Mean $E_{\mathrm{VQE}}$ & Mean $|\Delta E|$ & Mean Rel.\ Error & Mean Time (s) \\\midrule
+4  & -1.189693 & -1.187774 & 0.001918 & 0.16\% & 16.11 \\
+6  & -1.824057 & -1.799462 & 0.024595 & 1.35\% & 25.86 \\
+8  & -2.459488 & -2.403073 & 0.056415 & 2.29\% & 34.78 \\
+10 & -3.095372 & -3.024753 & 0.070619 & 2.28\% & 44.70 \\
+12 & -3.731493 & -3.633617 & 0.097876 & 2.62\% & 61.12 \\
+\bottomrule\end{tabular}
+\end{table}
+
+\plot{vqe_energy_vs_size.png}{VQE ground-state energy and seed spread versus $L$ ($g=0.5$, 2 layers).}{fig:vqe_size}
+\plot{vqe_parameter_sweeps.png}{VQE sensitivity to transverse field $g$, circuit depth, and Adam hyperparameters ($L=8$).}{fig:vqe_sweeps}
+
+Four physical and numerical mechanisms explain the VQE results (Figs.~\ref{fig:vqe_size}--\ref{fig:vqe_sweeps}):
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Monotonic error growth with $L$ at fixed depth:} Error increases $51\times$ from $L=4$ ($0.00192$) to $L=12$ ($0.09788$). A 2-layer nearest-neighbour circuit has a fixed correlation light-cone that cannot capture long-range critical entanglement across $L=12$ spins, while optimizing $4L$ parameters simultaneously becomes harder within 300 steps.
+\item \textbf{Why VQE fails hardest at low $g$ (initial-state bias):} Mean $|\Delta E|$ drops from $\approx 0.24$ at $g=0.10$ to $\approx 0.01$ at $g=1.00$. Hadamard gates prepare $\ket{+}^{\otimes L}$, which is already the exact ground state in the $g \to \infty$ paramagnetic limit; by contrast, transforming $\ket{+}^{\otimes L}$ into an entangled, staggered antiferromagnetic state at $g=0.10$ exceeds the expressivity of 2 shallow layers.
+\item \textbf{Depth expressivity threshold:} Increasing $p$ from $1 \to 4$ at $L=8, g=0.5$ reduces error from $\approx 0.092$ to $\approx 0.022$, with diminishing returns after $p=3$ where circuit expressivity covers most of the $L=8$ light-cone.
+\item \textbf{Optimizer sensitivity:} Under \texttt{lr=0.001}, Adam severely under-converges ($0.391$ error at 100 steps; $0.086$ at 600 steps). Increasing to \texttt{lr=0.05} cuts error across every budget ($0.055$ at 100 steps; $0.031$ at 300; $0.025$ at 600 steps, the best sampled setting).
+\end{enumerate}
+
+% ==============================================================================
+\section{Did We ``Torture the Model'' and Find Our PC's Limits?}
+% ==============================================================================
+\plot{limit_frontier.png}{Guarded frontier tests from \texttt{limit\_search.py} with $0.2\,\mathrm{s}$ RSS and RAM sampling.}{fig:frontier}
+
+Yes---both the computational hardware limits of this workstation and the physical/variational breaking points of the models were explicitly mapped without crashing Windows (Fig.~\ref{fig:frontier}, Table~\ref{tab:frontier}):
+
+\begin{table}[H]\centering
+\caption{Measured resource-frontier tests (\texttt{limit\_search.py}, $g=0.5$).}
+\label{tab:frontier}
+\begin{tabular}{llrrrr}\toprule
+Method & Case & Status & Time (s) & Peak RSS (MiB) & Energy $E$ \\\midrule
+DMRG/MPS & $L=120, \chi=16$ & \texttt{COMPLETED} & 3.49 & 179.4 & -38.106612 \\
+DMRG/MPS & $L=200, \chi=32$ & \texttt{COMPLETED} & 8.51 & 209.0 & -63.571293 \\
+DMRG/MPS & $L=40, \chi=128$ & \texttt{COMPLETED} & 18.21 & 211.1 & -12.642358 \\
+DMRG/MPS & $L=40, \chi=256$ & \texttt{COMPLETED} & 133.22 & 332.9 & -12.642358 \\
+VQE & $L=14$, 100 steps & \texttt{COMPLETED} & 40.31 & 510.7 & -4.181875 \\
+VQE & $L=16$, 50 steps & \texttt{COMPLETED} & 26.38 & 587.5 & -4.730271 \\
+VQE & $L=18$, 30 steps & \texttt{COMPLETED} & 28.81 & 853.0 & -5.072601 \\
+VQE & $L=20$, 15 steps & \texttt{COMPLETED} & 44.11 & 1868.4 & -5.262589 \\
+VQE & $L=22$, 10 steps & \texttt{SKIPPED\_MEMORY\_RESERVE} & 0.00 & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{Concrete hardware limit for Statevector VQE ($L \approx 20\text{--}22$ qubits):} On our $15.72\,\mathrm{GiB}$ RAM laptop ($\sim 3.9\text{--}4.0\,\mathrm{GiB}$ free before execution), TensorFlow VQE peak RSS doubled from $853\,\mathrm{MiB}$ ($L=18$) to $1868\,\mathrm{MiB}$ ($L=20$), dropping free system RAM to $2.56\,\mathrm{GiB}$ while taking $2.94\,\mathrm{s}$ per optimizer step. At $L=22$ ($4\times$ larger Hilbert space, $\sim 6\text{--}8\,\mathrm{GiB}$ working set), the run exceeded available RAM minus the $1.75\,\mathrm{GiB}$ OS reserve and triggered \texttt{SKIPPED\_MEMORY\_RESERVE}. Thus, \textbf{20--21 qubits is the true empirical memory wall} of eager statevector VQE on this machine.
+\item \textbf{Concrete bottleneck for DMRG/MPS (CPU time, not RAM):} Even at $L=200,\chi=32$ ($209\,\mathrm{MiB}$) and $L=40,\chi=256$ ($333\,\mathrm{MiB}$), DMRG uses $<3\%$ of installed RAM. Its practical frontier is \textbf{wall-clock time scaling as $O(\chi^3)$}: jumping from $\chi=128$ to $256$ multiplied runtime $7.3\times$ ($18.2\,\mathrm{s} \to 133.2\,\mathrm{s}$) for zero improvement in energy ($-12.642358285083$ vs.\ $-12.642358285080$).
+\item \textbf{Physical/variational breaking points exposed:} (i) Finite-size $\mathbb{Z}_2$ symmetry restoration breaks naive $\beta$ fits near $g_c$; (ii) open boundaries distort $\eta$ fits at larger distances; and (iii) shallow 2-layer VQE breaks down quantitatively in the antiferromagnetic phase ($g=0.10$, error $\approx 0.24$) and as chain length grows ($L=12$).
+\end{itemize}
+
+% ==============================================================================
+\section{Conclusion}
+% ==============================================================================
+By aligning both tutorial methods to a single Hamiltonian convention and stressing every physical and algorithmic dimension, this study demonstrates the fundamental trade-off between tensor networks and classical statevector simulation. In 1D, DMRG/MPS exploits bounded entanglement to achieve $\sim 10^{-8}$ accuracy against exact diagonalization and scale effortlessly to $L=200$ spins in seconds, constrained primarily by $O(\chi^3)$ runtime at high bond dimension. By contrast, classical statevector VQE suffers from shallow-circuit light-cone limitations in ordered phases and encounters an inescapable $O(2^L)$ memory wall around $20\text{--}22$ qubits on a $16\,\mathrm{GiB}$ CPU workstation.
+
+\begin{thebibliography}{9}
+\bibitem{Pfeuty} P. Pfeuty, ``The one-dimensional Ising model with a transverse field,'' \emph{Annals of Physics}, 57, 79--90 (1970). \url{https://doi.org/10.1016/0003-4916(70)90270-8}
+\bibitem{QuimbDMRG} Quimb documentation, DMRG ground-state search. \url{https://quimb.readthedocs.io/en/latest/autoapi/quimb/tensor/tn1d/dmrg/index.html}
+\bibitem{Quimb1D} Quimb documentation, one-dimensional tensor-network algorithms. \url{https://quimb.readthedocs.io/en/latest/tensor/tensor-1d.html}
+\bibitem{TensorCircuitVQE} TensorCircuit documentation, VQE tutorial. \url{https://tensorcircuit.readthedocs.io/en/latest/tutorials/vqe_h2o.html}
+\bibitem{CourseRepo} Quantum-AI-for-Queens, 2026--2027 tutorials. \url{https://github.com/jbermejovega/Quantum-AI-for-Queens}
+\end{thebibliography}
+\end{document}

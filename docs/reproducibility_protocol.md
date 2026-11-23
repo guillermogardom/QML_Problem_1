@@ -1,0 +1,7 @@
+# Reproducibility and Resource Protocol
+
+1. **Clean execution order:** Activate `.venv` and run `01_DMRG_MPS_Stress_Tests.ipynb`, then `02_VQE_TFIM_Stress_Tests.ipynb`, then `03_Lab_Report_and_Comparison.ipynb`.
+2. **Isolation of aligned outputs:** All outputs from the aligned `+J/4` campaign are saved under `results/tutorial_faithful/`. Do not pool archived negative-$j$ files from the top-level `results/` directory into the final comparison.
+3. **No duplicate rows on rerun:** Notebooks `01` and `02` overwrite their run-level CSV logs (`dmrg_runs.csv`, `vqe_runs.csv`) at the beginning of a full top-to-bottom run and append rows safely with automatic schema expansion if error/skip fields appear later.
+4. **Guarded frontier testing (`limit_search.py`):** Execute one case per invocation. The runner samples process RSS and system-available RAM every $0.2\text{ s}$ (brief spikes between samples may be missed). The preflight reserve (`min_free_gib >= 1.5 GiB`) protects system stability and must be reported as a configured guardrail, never as a solver failure.
+5. **Status accounting:** Always report `COMPLETED`, `TIME_BUDGET_STOPPED`, `INTERRUPTED`, `ERROR`, and `SKIPPED_*` counts separately.
